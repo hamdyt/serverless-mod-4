@@ -5,7 +5,6 @@ rm -f ../ws-serverless-patterns.zip
 rm -Rf ./userprofile
 # Get module start state setup package and unzip it into a temporary directory
 echo "Downloading module start state setup package..."
-#wget -O ws-serverless-patterns.zip 'https://github.com/hamdyt/serverless-mod-4/raw/main/ws-serverless-patterns-2023-12-10.zip' -q
 wget -O ws-serverless-patterns.zip https://github.com/hamdyt/serverless-mod-4/raw/main/ws-serverless-patterns-2023-12-10.zip
 unzip -qq ws-serverless-patterns.zip 'ws-serverless-patterns/userprofile/*' -d ./tmp/
 # Move module directory with start state into workshop root directory
