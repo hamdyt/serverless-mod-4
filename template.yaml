@@ -1,0 +1,669 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless Workshop Module 4 - Asynchronous Pattern with Event Bridge and SQS
+
+Parameters:
+  CognitoStackNameParameter:
+    Type: String
+    Default: serverless-workshop-cognito
+  Stage:
+    Type: String
+    Default: dev
+  Service:
+    Type: String
+    Default: workshop-module4-async
+
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 3
+    Tracing: Active
+    Layers:
+      - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPython:20
+  Api:
+    TracingEnabled: true
+
+Resources:
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -   AttributeName: id
+            AttributeType: S
+      KeySchema:
+        -   AttributeName: id
+            KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiration
+        Enabled: true
+      BillingMode: PAY_PER_REQUEST
+
+  UserAddressesTable:
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions: 
+        - AttributeName: "user_id"
+          AttributeType: "S"
+        - AttributeName: "address_id"
+          AttributeType: "S"
+      KeySchema: 
+        - AttributeName: "user_id"
+          KeyType: "HASH"
+        - AttributeName: "address_id"
+          KeyType: "RANGE"
+      BillingMode: PAY_PER_REQUEST
+
+  FavoritesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions: 
+        - AttributeName: "user_id"
+          AttributeType: "S"
+        - AttributeName: "restaurant_id"
+          AttributeType: "S"
+      KeySchema: 
+        - AttributeName: "user_id"
+          KeyType: "HASH"
+        - AttributeName: "restaurant_id"
+          KeyType: "RANGE"
+      BillingMode: PAY_PER_REQUEST      
+      
+
+  AddressBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "Address-${Service}-${Stage}"
+
+  # API Gateway role with permissions to put events on EventBridge
+  ApiGatewayEventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: !Join ["", ["/", !Ref "AWS::StackName", "/"]]
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowApiGatewayServiceToAssumeRole
+            Effect: Allow
+            Action: 
+              - 'sts:AssumeRole'
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+      Policies:
+        - PolicyName: EBPutEvents
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'events:PutEvents'
+                Resource:
+                  - !GetAtt AddressBus.Arn
+   
+  WorkshopApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: !Sub ${AWS::StackName}-api
+
+  AddressResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt WorkshopApiGateway.RootResourceId
+      PathPart: 'address'
+      RestApiId: !Ref WorkshopApiGateway
+
+  SingleAddressResource: 
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt AddressResource.ResourceId
+      PathPart: '{addressId}'
+      RestApiId: !Ref WorkshopApiGateway
+
+  AddAddressMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AuthorizersCognitoUserPools
+      AuthorizationScopes:
+        - openid
+      HttpMethod: POST
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+      RequestParameters:
+        method.request.header.X-Amz-Target: false
+        method.request.header.Content-Type: false
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Credentials: !GetAtt ApiGatewayEventBridgeRole.Arn
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:events:action/PutEvents
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          application/json: !Sub 
+            - |-
+              #set($context.requestOverride.header.X-Amz-Target = "AWSEvents.PutEvents")
+              #set($context.requestOverride.header.Content-Type = "application/x-amz-json-1.1")
+              #set($inputRoot = $input.path("$"))
+                { "Entries": [{
+                  "Detail": "{#foreach($paramName in $inputRoot.keySet())\"$paramName\" : \"$util.escapeJavaScript($inputRoot.get($paramName))\" #if($foreach.hasNext),#end #end,\"userId\": \"$context.authorizer.claims.sub\"}",
+                  "DetailType": "AddAddress",
+                  "EventBusName": "${EventBusName}",
+                  "Source": "serverless-workshop-module-4"
+                }]}
+            - { EventBusName: !Ref AddressBus }
+        IntegrationResponses: 
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: !Sub 
+                - |- 
+                  #set($inputRoot = $input.path('$'))
+                  {
+                  }
+                - {}
+      ResourceId: !Ref AddressResource
+      RestApiId: !Ref WorkshopApiGateway
+
+  EditAddressMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AuthorizersCognitoUserPools
+      AuthorizationScopes:
+        - openid
+      HttpMethod: PUT
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+      RequestParameters:
+        method.request.path.addressId: true      
+        method.request.header.X-Amz-Target: false
+        method.request.header.Content-Type: false
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Credentials: !GetAtt ApiGatewayEventBridgeRole.Arn
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:events:action/PutEvents
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          application/json: !Sub 
+            - |-
+              #set($context.requestOverride.header.X-Amz-Target = "AWSEvents.PutEvents")
+              #set($context.requestOverride.header.Content-Type = "application/x-amz-json-1.1")
+              #set($inputRoot = $input.path("$"))
+                { "Entries": [{
+                  "Detail": "{#foreach($paramName in $inputRoot.keySet())\"$paramName\" : \"$util.escapeJavaScript($inputRoot.get($paramName))\" #if($foreach.hasNext),#end #end,\"userId\": \"$context.authorizer.claims.sub\",\"addressId\": \"$input.params().get('path').get('addressId')\"}",
+                  "DetailType": "EditAddress",
+                  "EventBusName": "${EventBusName}",
+                  "Source": "serverless-workshop-module-4"
+                }]}
+            - { EventBusName: !Ref AddressBus }
+        IntegrationResponses: 
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: !Sub 
+                - |- 
+                  #set($inputRoot = $input.path('$'))
+                  {
+                  }
+                - {}
+      ResourceId: !Ref SingleAddressResource
+      RestApiId: !Ref WorkshopApiGateway
+
+  DeleteAddressMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AuthorizersCognitoUserPools
+      AuthorizationScopes:
+        - openid
+      HttpMethod: DELETE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+      RequestParameters:
+        method.request.path.addressId: true      
+        method.request.header.X-Amz-Target: false
+        method.request.header.Content-Type: false
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Credentials: !GetAtt ApiGatewayEventBridgeRole.Arn
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:events:action/PutEvents
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          application/json: !Sub 
+            - |-
+              #set($context.requestOverride.header.X-Amz-Target = "AWSEvents.PutEvents")
+              #set($context.requestOverride.header.Content-Type = "application/x-amz-json-1.1")
+              #set($inputRoot = $input.path('$'))
+              #set($addressId = $input.params('addressId'))
+              {
+                "Entries": [
+                  {
+                    "Detail": "{\"userId\": \"$context.authorizer.claims.sub\",\"addressId\": \"$input.params().get('path').get('addressId')\"}",
+                    "DetailType": "DeleteAddress",
+                    "EventBusName": "${EventBusName}",
+                    "Source": "serverless-workshop-module-4"
+                  }
+                ]
+              }
+            - { EventBusName: !Ref AddressBus }
+        IntegrationResponses: 
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: !Sub 
+                - |- 
+                  #set($inputRoot = $input.path('$'))
+                  {
+                  }
+                - {}
+      ResourceId: !Ref SingleAddressResource
+      RestApiId: !Ref WorkshopApiGateway 
+            
+  WorkshopApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: 
+      - AddAddressMethod
+      - EditAddressMethod
+      - DeleteAddressMethod
+      - ListUserAddressesMethod
+      - AddFavoriteMethod
+      - DeleteFavoriteMethod
+      - ListUserFavoritesMethod
+    Properties:
+      RestApiId: !Ref WorkshopApiGateway
+      StageName: !Sub "${Stage}"
+
+  AuthorizersCognitoUserPools:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      Type: COGNITO_USER_POOLS
+      RestApiId: !Ref WorkshopApiGateway
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs: 
+      -  Fn::ImportValue:
+          !Sub "${CognitoStackNameParameter}-UserPoolArn"
+
+  AddUserAddressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: add_user_address/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Tracing: Active
+      Policies:
+        DynamoDBCrudPolicy:
+          TableName: "*"
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UserAddressesTable
+          IDEMPOTENCY_TABLE_NAME: !Ref IdempotencyTable
+          POWERTOOLS_SERVICE_NAME: serverless-workshop
+      Events:
+        Trigger:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref AddressBus
+            Pattern:
+              source: 
+                - serverless-workshop-module-4
+              detail-type:
+                - AddAddress
+
+  EditUserAddressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: edit_user_address/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Tracing: Active
+      Policies:
+        DynamoDBCrudPolicy:
+          TableName: "*"
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UserAddressesTable
+          IDEMPOTENCY_TABLE_NAME: !Ref IdempotencyTable
+          POWERTOOLS_SERVICE_NAME: serverless-workshop
+      Events:
+        Trigger:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref AddressBus
+            Pattern:
+              source: 
+                - serverless-workshop-module-4
+              detail-type:
+                - EditAddress 
+
+  DeleteUserAddressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: delete_user_address/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Tracing: Active
+      Policies:
+        DynamoDBCrudPolicy:
+          TableName: "*"
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UserAddressesTable
+          IDEMPOTENCY_TABLE_NAME: !Ref IdempotencyTable
+          POWERTOOLS_SERVICE_NAME: serverless-workshop
+      Events:
+        Trigger:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref AddressBus
+            Pattern:
+              source: 
+                - serverless-workshop-module-4
+              detail-type:
+                - DeleteAddress                               
+
+  ListUserAddressesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: read_user_addresses
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Policies:
+        DynamoDBReadPolicy:
+          TableName: !Ref UserAddressesTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UserAddressesTable
+
+  ListUserAddressesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AuthorizersCognitoUserPools
+      AuthorizationScopes:
+        - openid
+      HttpMethod: GET
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations
+          - lambdaArn: !GetAtt ListUserAddressesFunction.Arn
+      ResourceId: !Ref AddressResource
+      RestApiId: !Ref WorkshopApiGateway 
+
+  ListUserAddressesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref ListUserAddressesFunction
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:", 
+          {"Ref": "AWS::Region"}, ":", 
+          {"Ref": "AWS::AccountId"}, ":", 
+          !Ref WorkshopApiGateway, "/*/*/*"
+          ]
+        ] 
+
+  FavoriteRestaurantsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      DelaySeconds: 0
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 1209600
+      QueueName: !Sub "FavoriteRestaurants-${Service}-${Stage}"
+      ReceiveMessageWaitTimeSeconds: 0
+      VisibilityTimeout: 30
+
+
+  FavoriteRestaurantsQueuePolicySQS:
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: SQS:*
+            Effect: Allow
+            Principal:
+              AWS: !Ref 'AWS::AccountId'
+            Resource: !GetAtt FavoriteRestaurantsQueue.Arn
+          - Action: SQS:SendMessage
+            Effect: Allow
+            Principal: 
+              AWS: !GetAtt APIGatewayQueueCommandRole.Arn
+            Resource: !GetAtt FavoriteRestaurantsQueue.Arn
+        Version: '2012-10-17'
+      Queues:
+        - !Ref FavoriteRestaurantsQueue
+    Type: AWS::SQS::QueuePolicy 
+
+  APIGatewayQueueCommandRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: sqs:SendMessage
+                Effect: Allow
+                Resource: !GetAtt FavoriteRestaurantsQueue.Arn
+            Version: '2012-10-17'
+          PolicyName: PolicySQS
+
+
+  FavoriteResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt WorkshopApiGateway.RootResourceId
+      PathPart: 'favorite'
+      RestApiId: !Ref WorkshopApiGateway
+
+  SingleFavoriteResource: 
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt FavoriteResource.ResourceId
+      PathPart: '{restaurantId}'
+      RestApiId: !Ref WorkshopApiGateway
+
+  AddFavoriteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AuthorizersCognitoUserPools
+      AuthorizationScopes:
+        - openid
+      HttpMethod: POST
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+      RequestParameters: 
+        method.request.header.X-Amz-Target: false
+        method.request.header.Content-Type: false
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Credentials: !GetAtt APIGatewayQueueCommandRole.Arn
+        Uri: !Join
+          - ''
+          - - 'arn:aws:apigateway:'
+            - !Ref 'AWS::Region'
+            - :sqs:path/
+            - !Ref 'AWS::AccountId'
+            - /
+            - !GetAtt FavoriteRestaurantsQueue.QueueName
+        PassthroughBehavior: NEVER
+        RequestParameters:
+          integration.request.header.Content-Type: '''application/x-www-form-urlencoded'''
+        RequestTemplates:
+          application/json: !Join
+            - ''
+            - - '#set($inputRoot = $input.path("$"))Action=SendMessage'
+              - '&MessageBody=$inputRoot.get(''restaurantId'')'
+              - '&MessageAttributes.1.Name=CommandName'
+              - '&MessageAttributes.1.Value.StringValue=AddFavorite'
+              - '&MessageAttributes.1.Value.DataType=String'
+              - '&MessageAttributes.2.Name=UserId'
+              - '&MessageAttributes.2.Value.StringValue=$context.authorizer.claims.sub'
+              - '&MessageAttributes.2.Value.DataType=String'
+              - '&Version=2012-11-05'
+        IntegrationResponses: 
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: !Sub 
+                - |- 
+                  #set($inputRoot = $input.path('$'))
+                  {
+                  }
+                - {}
+      ResourceId: !Ref FavoriteResource
+      RestApiId: !Ref WorkshopApiGateway
+
+  DeleteFavoriteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AuthorizersCognitoUserPools
+      AuthorizationScopes:
+        - openid
+      HttpMethod: DELETE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+      RequestParameters:
+        method.request.path.favoriteId: true  
+        method.request.header.X-Amz-Target: false
+        method.request.header.Content-Type: false
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Credentials: !GetAtt APIGatewayQueueCommandRole.Arn
+        Uri: !Join
+          - ''
+          - - 'arn:aws:apigateway:'
+            - !Ref 'AWS::Region'
+            - :sqs:path/
+            - !Ref 'AWS::AccountId'
+            - /
+            - !GetAtt FavoriteRestaurantsQueue.QueueName
+        PassthroughBehavior: NEVER
+        RequestParameters:
+          integration.request.header.Content-Type: '''application/x-www-form-urlencoded'''
+        RequestTemplates:
+          application/json: !Join
+            - ''
+            - - 'Action=SendMessage'
+              - '&MessageBody=$input.params().get(''path'').get(''restaurantId'')'
+              - '&MessageAttributes.1.Name=CommandName'
+              - '&MessageAttributes.1.Value.StringValue=DeleteFavorite'
+              - '&MessageAttributes.1.Value.DataType=String'
+              - '&MessageAttributes.2.Name=UserId'
+              - '&MessageAttributes.2.Value.StringValue=$context.authorizer.claims.sub'
+              - '&MessageAttributes.2.Value.DataType=String'
+              - '&Version=2012-11-05'        
+        IntegrationResponses: 
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: !Sub 
+                - |- 
+                  #set($inputRoot = $input.path('$'))
+                  {
+                  }
+                - {}
+      ResourceId: !Ref SingleFavoriteResource
+      RestApiId: !Ref WorkshopApiGateway
+  
+  ListUserFavoritesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: read_user_favorites
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Policies:
+        DynamoDBReadPolicy:
+          TableName: !Ref FavoritesTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FavoritesTable
+          POWERTOOLS_SERVICE_NAME: serverless-workshop
+
+  ProcessFavoriteRestaurantsQueueFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: process_favorites_queue
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Policies:
+        DynamoDBCrudPolicy:
+          TableName: "*"
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FavoritesTable
+          IDEMPOTENCY_TABLE_NAME: !Ref IdempotencyTable
+          POWERTOOLS_SERVICE_NAME: serverless-workshop
+      Events:
+        Trigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FavoriteRestaurantsQueue.Arn
+
+  ListUserFavoritesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref ListUserFavoritesFunction
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:", 
+          {"Ref": "AWS::Region"}, ":", 
+          {"Ref": "AWS::AccountId"}, ":", 
+          !Ref WorkshopApiGateway, "/*/*/*"
+          ]
+        ] 
+
+  ListUserFavoritesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AuthorizersCognitoUserPools
+      AuthorizationScopes:
+        - openid
+      HttpMethod: GET
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations
+          - lambdaArn: !GetAtt ListUserFavoritesFunction.Arn
+      ResourceId: !Ref FavoriteResource
+      RestApiId: !Ref WorkshopApiGateway 
+
+Outputs:
+  # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
+  # Find out more about other implicit resources you can reference within SAM
+  # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${WorkshopApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/"
